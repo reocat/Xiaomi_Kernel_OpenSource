@@ -56,14 +56,44 @@
 #define UETH__VERSION	"29-May-2008"
 
 /* Experiments show that both Linux and Windows hosts allow up to 16k
- * frame sizes. Set the max size to 15k+52 to prevent allocating 32k
+ * frame sizes. Set the max MTU size to 15k+52 to prevent allocating 32k
  * blocks and still have efficient handling. */
-#define GETHER_MAX_ETH_FRAME_LEN 15412
+#define GETHER_MAX_MTU_SIZE 15412
+#define GETHER_MAX_ETH_FRAME_LEN (GETHER_MAX_MTU_SIZE + ETH_HLEN)
 
-static struct workqueue_struct	*uether_wq;
-static struct workqueue_struct	*uether_wq1;
+struct eth_dev {
+	/* lock is held while accessing port_usb
+	 */
+	spinlock_t		lock;
+	struct gether		*port_usb;
 
-USB_ETHERNET_MODULE_PARAMETERS();
+	struct net_device	*net;
+	struct usb_gadget	*gadget;
+
+	spinlock_t		req_lock;	/* guard {rx,tx}_reqs */
+	struct list_head	tx_reqs, rx_reqs;
+	atomic_t		tx_qlen;
+
+	struct sk_buff_head	rx_frames;
+
+	unsigned		qmult;
+
+	unsigned		header_len;
+	struct sk_buff		*(*wrap)(struct gether *, struct sk_buff *skb);
+	int			(*unwrap)(struct gether *,
+						struct sk_buff *skb,
+						struct sk_buff_head *list);
+
+	struct work_struct	work;
+
+	unsigned long		todo;
+#define	WORK_RX_MEMORY		0
+
+	bool			zlp;
+	bool			no_skb_reserve;
+	u8			host_mac[ETH_ALEN];
+	u8			dev_mac[ETH_ALEN];
+};
 
 /*-------------------------------------------------------------------------*/
 
@@ -71,51 +101,11 @@ USB_ETHERNET_MODULE_PARAMETERS();
 
 #define DEFAULT_QLEN	2	/* double buffering by default */
 
-static unsigned int tx_wakeup_threshold = 13;
-module_param(tx_wakeup_threshold, uint, 0644);
-MODULE_PARM_DESC(tx_wakeup_threshold, "tx wakeup threshold value");
-
-static int u_ether_tx_req_threshold = 1;
-module_param(u_ether_tx_req_threshold, uint, 0644);
-MODULE_PARM_DESC(u_ether_tx_req_threshold, "u_ether_tx_req_threshold value");
-
-#define U_ETHER_RX_PENDING_TSHOLD 100
-static unsigned int u_ether_rx_pending_thld = U_ETHER_RX_PENDING_TSHOLD;
-module_param(u_ether_rx_pending_thld, uint, 0644);
-
-static int rndis_mtu;
-module_param(rndis_mtu, uint, 0644);
-MODULE_PARM_DESC(rndis_mtu, "Set RNDIS MTU value");
-
-static int rndis_gso;
-module_param(rndis_gso, uint, 0644);
-MODULE_PARM_DESC(rndis_gso, "Enable RNDIS GSO");
-
-static int uether_debug;
-module_param(uether_debug, uint, 0644);
-MODULE_PARM_DESC(uether_debug, "Enable U_Ether Debug");
-
-static int ip_debug;
-module_param(ip_debug, uint, 0644);
-MODULE_PARM_DESC(ip_debug, "Enable IPID Debug");
-
-static int ip_debug_ratelimit;
-module_param(ip_debug_ratelimit, uint, 0644);
-MODULE_PARM_DESC(ip_debug_ratelimit, "Enable IP Debug ratelimit");
-
-static int uether_tx_profile;
-module_param(uether_tx_profile, uint, 0644);
-MODULE_PARM_DESC(uether_tx_profile, "Profile TX XMIT");
-
-static bool tx_profile_start;
-static ktime_t starttime;
-static unsigned long long rec_data_len;
-
 /* for dual-speed hardware, use deeper queues at high/super speed */
 static inline int qlen(struct usb_gadget *gadget, unsigned qmult)
 {
 	if (gadget_is_dualspeed(gadget) && (gadget->speed == USB_SPEED_HIGH ||
-					    gadget->speed == USB_SPEED_SUPER))
+					    gadget->speed >= USB_SPEED_SUPER))
 		return qmult * DEFAULT_QLEN;
 	else
 		return DEFAULT_QLEN;
@@ -843,9 +833,9 @@ static netdev_tx_t eth_start_xmit(struct sk_buff *skb,
 	}
 	spin_unlock_irqrestore(&dev->lock, flags);
 
-	if (skb && !in) {
-		dev_kfree_skb_any(skb);
-		U_ETHER_DBG("%s - wrong direction!\n", __func__);
+	if (!in) {
+		if (skb)
+			dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
 	}
 
@@ -1287,10 +1277,13 @@ struct eth_dev *gether_setup_name(struct usb_gadget *g,
 	dev->qmult = qmult;
 	snprintf(net->name, sizeof(net->name), "%s%%d", netname);
 
-#if 0
-	if (get_ether_addr(dev_addr, net->dev_addr))
-		dev_info(&g->dev, "using random %s ethernet address\n", "self");
-
+	if (get_ether_addr(dev_addr, net->dev_addr)) {
+		net->addr_assign_type = NET_ADDR_RANDOM;
+		dev_warn(&g->dev,
+			"using random %s ethernet address\n", "self");
+	} else {
+		net->addr_assign_type = NET_ADDR_SET;
+	}
 	if (get_ether_addr(host_addr, dev->host_mac))
 		dev_info(&g->dev, "using random %s ethernet address\n", "host");
 #else
@@ -1311,6 +1304,10 @@ struct eth_dev *gether_setup_name(struct usb_gadget *g,
 	net->netdev_ops = &eth_netdev_ops;
 
 	net->ethtool_ops = &ops;
+
+	/* MTU range: 14 - 15412 */
+	net->min_mtu = ETH_HLEN;
+	net->max_mtu = GETHER_MAX_MTU_SIZE;
 
 	dev->gadget = g;
 	SET_NETDEV_DEV(net, &g->dev);
@@ -1356,6 +1353,9 @@ struct net_device *gether_setup_name_default(const char *netname)
 	INIT_LIST_HEAD(&dev->tx_reqs);
 	INIT_LIST_HEAD(&dev->rx_reqs);
 
+	/* by default we always have a random MAC address */
+	net->addr_assign_type = NET_ADDR_RANDOM;
+
 	skb_queue_head_init(&dev->rx_frames);
 
 	/* network device setup */
@@ -1382,6 +1382,10 @@ struct net_device *gether_setup_name_default(const char *netname)
 	net->ethtool_ops = &ops;
 	SET_NETDEV_DEVTYPE(net, &gadget_type);
 
+	/* MTU range: 14 - 15412 */
+	net->min_mtu = ETH_HLEN;
+	net->max_mtu = GETHER_MAX_MTU_SIZE;
+
 	return net;
 }
 EXPORT_SYMBOL_GPL(gether_setup_name_default);
@@ -1390,19 +1394,22 @@ int gether_register_netdev(struct net_device *net)
 {
 	struct eth_dev *dev;
 	struct usb_gadget *g;
-	struct sockaddr sa;
 	int status;
 
 	if (!net->dev.parent)
 		return -EINVAL;
 	dev = netdev_priv(net);
 	g = dev->gadget;
+
+	memcpy(net->dev_addr, dev->dev_mac, ETH_ALEN);
+
 	status = register_netdev(net);
 	if (status < 0) {
 		dev_dbg(&g->dev, "register_netdev failed, %d\n", status);
 		return status;
 	} else {
 		INFO(dev, "HOST MAC %pM\n", dev->host_mac);
+		INFO(dev, "MAC %pM\n", dev->dev_mac);
 
 		/* two kinds of host-initiated state changes:
 		 *  - iff DATA transfer is active, carrier is "on"
@@ -1410,15 +1417,6 @@ int gether_register_netdev(struct net_device *net)
 		 */
 		netif_carrier_off(net);
 	}
-	sa.sa_family = net->type;
-	memcpy(sa.sa_data, dev->dev_mac, ETH_ALEN);
-	rtnl_lock();
-	status = dev_set_mac_address(net, &sa);
-	rtnl_unlock();
-	if (status)
-		pr_warn("cannot set self ethernet address: %d\n", status);
-	else
-		INFO(dev, "MAC %pM\n", dev->dev_mac);
 
 	return status;
 }
@@ -1443,6 +1441,7 @@ int gether_set_dev_addr(struct net_device *net, const char *dev_addr)
 	if (get_ether_addr(dev_addr, new_addr))
 		return -EINVAL;
 	memcpy(dev->dev_mac, new_addr, ETH_ALEN);
+	net->addr_assign_type = NET_ADDR_SET;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(gether_set_dev_addr);
