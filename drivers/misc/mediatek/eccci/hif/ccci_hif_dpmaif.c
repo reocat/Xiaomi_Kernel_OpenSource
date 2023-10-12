@@ -480,22 +480,23 @@ static void dump_drb_queue_data(unsigned int qno)
 	}
 
 	if (mod64 > 0) {
-		data_8ptr = (u8 *)data_64ptr;
+    		data_8ptr = (u8 *)data_64ptr;
 
-		DPMA_DRB_DATA_INFO("%08X(%04d):", (u32)data_8ptr, count * 8);
+   		DPMA_DRB_DATA_INFO("%08lX(%04d):", (uintptr_t)data_8ptr, count * 8);
 
-		for (i = 0; i < mod64; i++) {
-			if ((i % 8) == 0)
-				DPMA_DRB_DATA_INFO(" ");
+  		for (i = 0; i < mod64; i++) {
+        		if ((i % 8) == 0)
+            			DPMA_DRB_DATA_INFO(" ");
 
-			DPMA_DRB_DATA_INFO("%02X", *(data_8ptr + i));
-		}
+       			DPMA_DRB_DATA_INFO("%02X", *(data_8ptr + i));
+    		}
 
-		DPMA_DRB_DATA_INFO("\n");
+    		DPMA_DRB_DATA_INFO("\n");
 	}
 
 	DPMA_DRB_DATA_INFO("DPMAIF [%s] for q:%d info: end --------\n",
-			__func__, qno);
+        		__func__, qno);
+
 }
 
 /*actrually, length is dump flag's private argument*/
