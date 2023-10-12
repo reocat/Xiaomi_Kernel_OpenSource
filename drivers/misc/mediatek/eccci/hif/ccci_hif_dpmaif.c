@@ -467,16 +467,17 @@ static void dump_drb_queue_data(unsigned int qno)
 			__func__, drb_buf_size, mod64, count);
 
 	i = 0;
-	while (i < count) {
-		DPMA_DRB_DATA_INFO("%08X(%04d): %016llX %016llX %016llX %016llX %016llX %016llX %016llX %016llX\n",
-			(u32)data_64ptr, (i * 8),
-			*data_64ptr, *(data_64ptr + 1),
-			*(data_64ptr + 2), *(data_64ptr + 3),
-			*(data_64ptr + 4), *(data_64ptr + 5),
-			*(data_64ptr + 6), *(data_64ptr + 7));
 
-		data_64ptr += 8;
-		i++;
+	while (i < count) {
+    		DPMA_DRB_DATA_INFO("%p(%04d): %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+        		(void *)data_64ptr, (i * 8),
+        		*data_64ptr, *(data_64ptr + 1),
+        		*(data_64ptr + 2), *(data_64ptr + 3),
+        	 	*(data_64ptr + 4), *(data_64ptr + 5),
+        		*(data_64ptr + 6), *(data_64ptr + 7));
+
+    		data_64ptr += 8;
+    		i++;
 	}
 
 	if (mod64 > 0) {
