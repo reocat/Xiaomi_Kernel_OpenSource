@@ -307,8 +307,9 @@ static int mcupm_init_v1(struct pll_dts *array, struct match *match)
 	priv_data->domain = get_fh_domain(array->domain);
 
 	match_data = match->hdlr->data;
+	
 	if (match_data && match_data->reg_tr) {
-    		priv_data->reg_tr = (unsigned int)(uintptr_t)(array->fhctl_base + match_data->reg_tr);
+ 		priv_data->reg_tr = (unsigned int)((uintptr_t)array->fhctl_base + (uintptr_t)match_data->reg_tr);
 	}
 
 	/* hook to array */
